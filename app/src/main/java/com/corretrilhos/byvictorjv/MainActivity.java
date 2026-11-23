@@ -5,14 +5,12 @@ import android.content.ActivityNotFoundException;
 import android.content.Intent;
 import android.graphics.Color;
 import android.net.Uri;
-import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.view.Gravity;
 import android.view.View;
-import android.view.WindowInsets;
-import android.view.WindowInsetsController;
+import android.view.Window;
 import android.view.WindowManager;
 import android.webkit.CookieManager;
 import android.webkit.WebChromeClient;
@@ -34,44 +32,62 @@ public class MainActivity extends Activity {
     private final Handler handler = new Handler(Looper.getMainLooper());
     private FrameLayout root;
     private WebView webView;
-    private View splash;
-    private WebChromeClient chromeClient;
+    private View fullscreenCustomView;
+    private WebChromeClient.CustomViewCallback fullscreenCallback;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-        applyFullscreen();
-        getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
 
+        // Install the first screen before changing system bars or creating WebView.
+        // This keeps startup visible even on devices with customized Android UI.
         root = new FrameLayout(this);
-        root.setBackgroundColor(Color.BLACK);
+        root.setBackgroundColor(Color.rgb(3, 116, 202));
         setContentView(root);
 
-        splash = new LoadingScreenView(this);
-        root.addView(splash, matchParent());
+        try {
+            getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
+                    | WindowManager.LayoutParams.FLAG_FULLSCREEN);
 
-        handler.postDelayed(() -> {
-            if (!isFinishing()) showWebsite();
-        }, SPLASH_DURATION_MS);
+            LoadingScreenView splash = new LoadingScreenView(this);
+            root.addView(splash, matchParent());
+            applyImmersiveMode();
+            root.post(this::applyImmersiveMode);
+
+            handler.postDelayed(() -> {
+                if (!isFinishing() && !isDestroyed()) {
+                    showWebsite();
+                }
+            }, SPLASH_DURATION_MS);
+        } catch (Throwable error) {
+            showFatalError("Não foi possível iniciar a tela de abertura.", error);
+        }
     }
 
     private void showWebsite() {
-        if (webView != null || isFinishing()) return;
+        if (webView != null || isFinishing() || root == null) return;
 
+        WebView candidate = null;
         try {
-            webView = new WebView(getApplicationContext());
-            // Re-attach the WebView to this Activity's context so dialogs/fullscreen
-            // and WebChromeClient work correctly on Android devices.
-            webView = new WebView(this);
-            configureWebView(webView);
+            // Use the Activity context. A WebView created with the application
+            // context can fail on some Android/WebView provider combinations.
+            candidate = new WebView(this);
+            configureWebView(candidate);
 
             root.removeAllViews();
-            root.addView(webView, matchParent());
-            applyFullscreen();
-            webView.loadUrl(START_URL);
+            root.addView(candidate, matchParent());
+            webView = candidate;
+            applyImmersiveMode();
+            candidate.loadUrl(START_URL);
         } catch (Throwable error) {
+            if (candidate != null) {
+                try {
+                    candidate.stopLoading();
+                    candidate.destroy();
+                } catch (Throwable ignored) { }
+            }
             webView = null;
-            showFatalError(error);
+            showFatalError("Não foi possível abrir o jogo no WebView.", error);
         }
     }
 
@@ -81,67 +97,81 @@ public class MainActivity extends Activity {
         view.setVerticalScrollBarEnabled(false);
         view.setHorizontalScrollBarEnabled(false);
 
-        WebSettings s = view.getSettings();
-        s.setJavaScriptEnabled(true);
-        s.setDomStorageEnabled(true);
-        s.setDatabaseEnabled(true);
-        s.setLoadsImagesAutomatically(true);
-        s.setMediaPlaybackRequiresUserGesture(false);
-        s.setSupportZoom(false);
-        s.setBuiltInZoomControls(false);
-        s.setDisplayZoomControls(false);
-        s.setJavaScriptCanOpenWindowsAutomatically(true);
-        s.setSupportMultipleWindows(false);
-        s.setDefaultTextEncodingName("UTF-8");
-        s.setCacheMode(WebSettings.LOAD_DEFAULT);
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-            s.setMixedContentMode(WebSettings.MIXED_CONTENT_NEVER_ALLOW);
-        }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            try { s.setSafeBrowsingEnabled(true); } catch (Throwable ignored) {}
-        }
+        WebSettings settings = view.getSettings();
+        settings.setJavaScriptEnabled(true);
+        settings.setDomStorageEnabled(true);
+        settings.setDatabaseEnabled(true);
+        settings.setLoadsImagesAutomatically(true);
+        settings.setMediaPlaybackRequiresUserGesture(false);
+        settings.setSupportZoom(false);
+        settings.setBuiltInZoomControls(false);
+        settings.setDisplayZoomControls(false);
+        settings.setJavaScriptCanOpenWindowsAutomatically(true);
+        settings.setSupportMultipleWindows(false);
+        settings.setDefaultTextEncodingName("UTF-8");
+        settings.setCacheMode(WebSettings.LOAD_DEFAULT);
 
         CookieManager cookies = CookieManager.getInstance();
         cookies.setAcceptCookie(true);
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-            cookies.setAcceptThirdPartyCookies(view, true);
-        }
+        cookies.setAcceptThirdPartyCookies(view, true);
 
         view.setWebViewClient(new WebViewClient() {
             @Override
             public boolean shouldOverrideUrlLoading(WebView v, WebResourceRequest request) {
-                return openUrl(request.getUrl());
+                return handleUrl(request.getUrl());
             }
 
             @Override
             public boolean shouldOverrideUrlLoading(WebView v, String url) {
-                return openUrl(Uri.parse(url));
+                return handleUrl(Uri.parse(url));
             }
 
             @Override
-            public void onReceivedError(WebView v, WebResourceRequest request, WebResourceError error) {
+            public void onReceivedError(WebView v, WebResourceRequest request,
+                                        WebResourceError error) {
+                super.onReceivedError(v, request, error);
                 if (request.isForMainFrame()) showNetworkError();
             }
         });
 
-        chromeClient = new WebChromeClient() {
+        view.setWebChromeClient(new WebChromeClient() {
             @Override
             public void onShowCustomView(View view, CustomViewCallback callback) {
+                if (fullscreenCustomView != null) {
+                    callback.onCustomViewHidden();
+                    return;
+                }
+                fullscreenCustomView = view;
+                fullscreenCallback = callback;
                 root.addView(view, matchParent());
-                applyFullscreen();
+                applyImmersiveMode();
             }
-        };
-        view.setWebChromeClient(chromeClient);
+
+            @Override
+            public void onHideCustomView() {
+                hideCustomView();
+            }
+        });
     }
 
-    private boolean openUrl(Uri uri) {
+    private void hideCustomView() {
+        if (fullscreenCustomView == null) return;
+        root.removeView(fullscreenCustomView);
+        fullscreenCustomView = null;
+        if (fullscreenCallback != null) {
+            fullscreenCallback.onCustomViewHidden();
+            fullscreenCallback = null;
+        }
+        applyImmersiveMode();
+    }
+
+    private boolean handleUrl(Uri uri) {
         String scheme = uri.getScheme();
-        if (scheme == null || scheme.equalsIgnoreCase("http")
-                || scheme.equalsIgnoreCase("https")
-                || scheme.equalsIgnoreCase("about")
-                || scheme.equalsIgnoreCase("data")
-                || scheme.equalsIgnoreCase("blob")) {
+        if (scheme == null || "http".equalsIgnoreCase(scheme)
+                || "https".equalsIgnoreCase(scheme)
+                || "about".equalsIgnoreCase(scheme)
+                || "data".equalsIgnoreCase(scheme)
+                || "blob".equalsIgnoreCase(scheme)) {
             return false;
         }
 
@@ -158,14 +188,14 @@ public class MainActivity extends Activity {
                 intent = new Intent(Intent.ACTION_VIEW, uri);
             }
             startActivity(intent);
-        } catch (ActivityNotFoundException | java.net.URISyntaxException e) {
+        } catch (ActivityNotFoundException | java.net.URISyntaxException error) {
             Toast.makeText(this, "Não foi possível abrir este endereço.", Toast.LENGTH_SHORT).show();
         }
         return true;
     }
 
     private void showNetworkError() {
-        if (root.findViewWithTag("network-error") != null) return;
+        if (root == null || root.findViewWithTag("network-error") != null) return;
 
         LinearLayout panel = new LinearLayout(this);
         panel.setTag("network-error");
@@ -182,7 +212,7 @@ public class MainActivity extends Activity {
         title.setTypeface(null, android.graphics.Typeface.BOLD);
 
         TextView detail = new TextView(this);
-        detail.setText("Verifique a internet e tente novamente.");
+        detail.setText("Confira sua conexão com a internet e tente novamente.");
         detail.setTextColor(Color.rgb(207, 225, 244));
         detail.setTextSize(15);
         detail.setGravity(Gravity.CENTER);
@@ -194,18 +224,23 @@ public class MainActivity extends Activity {
             if (webView != null) webView.reload();
         });
 
-        LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(
+        LinearLayout.LayoutParams buttonParams = new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-        p.topMargin = dp(20);
+        buttonParams.topMargin = dp(20);
 
         panel.addView(title);
         panel.addView(detail);
-        panel.addView(retry, p);
+        panel.addView(retry, buttonParams);
         root.addView(panel, matchParent());
     }
 
-    private void showFatalError(Throwable error) {
+    private void showFatalError(String message, Throwable error) {
+        if (root == null) {
+            root = new FrameLayout(this);
+            setContentView(root);
+        }
         root.removeAllViews();
+
         LinearLayout panel = new LinearLayout(this);
         panel.setOrientation(LinearLayout.VERTICAL);
         panel.setGravity(Gravity.CENTER);
@@ -220,26 +255,26 @@ public class MainActivity extends Activity {
         title.setGravity(Gravity.CENTER);
 
         TextView detail = new TextView(this);
-        detail.setText("Não foi possível iniciar o WebView.\n\n" +
-                error.getClass().getSimpleName());
+        String reason = error == null ? "Erro desconhecido" : error.getClass().getSimpleName();
+        detail.setText(message + "\n\nDetalhe: " + reason
+                + (error != null && error.getMessage() != null ? "\n" + error.getMessage() : ""));
         detail.setTextColor(Color.rgb(207, 225, 244));
         detail.setTextSize(15);
         detail.setGravity(Gravity.CENTER);
 
         Button retry = new Button(this);
-        retry.setText("REINICIAR");
-        retry.setOnClickListener(v -> {
-            recreate();
-        });
+        retry.setText("TENTAR NOVAMENTE");
+        retry.setOnClickListener(v -> recreate());
 
-        LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(
+        LinearLayout.LayoutParams buttonParams = new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-        p.topMargin = dp(20);
+        buttonParams.topMargin = dp(20);
 
         panel.addView(title);
         panel.addView(detail);
-        panel.addView(retry, p);
+        panel.addView(retry, buttonParams);
         root.addView(panel, matchParent());
+        applyImmersiveMode();
     }
 
     private FrameLayout.LayoutParams matchParent() {
@@ -248,44 +283,36 @@ public class MainActivity extends Activity {
                 FrameLayout.LayoutParams.MATCH_PARENT);
     }
 
-    private int dp(float v) {
-        return Math.round(v * getResources().getDisplayMetrics().density);
+    private int dp(float value) {
+        return Math.round(value * getResources().getDisplayMetrics().density);
     }
 
-    private void applyFullscreen() {
-        WindowManager.LayoutParams lp = getWindow().getAttributes();
-        lp.flags |= WindowManager.LayoutParams.FLAG_FULLSCREEN;
-        getWindow().setAttributes(lp);
+    @SuppressWarnings("deprecation")
+    private void applyImmersiveMode() {
+        Window window = getWindow();
+        if (window == null) return;
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            getWindow().setDecorFitsSystemWindows(false);
-            WindowInsetsController c = getWindow().getInsetsController();
-            if (c != null) {
-                c.hide(WindowInsets.Type.statusBars() | WindowInsets.Type.navigationBars());
-                c.setSystemBarsBehavior(WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
-            }
-        } else {
-            getWindow().getDecorView().setSystemUiVisibility(
-                    View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
-                    | View.SYSTEM_UI_FLAG_FULLSCREEN
-                    | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
-                    | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
-                    | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
-                    | View.SYSTEM_UI_FLAG_LAYOUT_STABLE);
-        }
+        window.addFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN);
+        window.getDecorView().setSystemUiVisibility(
+                View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+                        | View.SYSTEM_UI_FLAG_FULLSCREEN
+                        | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                        | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                        | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+                        | View.SYSTEM_UI_FLAG_LAYOUT_STABLE);
     }
 
     @Override
     public void onWindowFocusChanged(boolean hasFocus) {
         super.onWindowFocusChanged(hasFocus);
-        if (hasFocus) applyFullscreen();
+        if (hasFocus) applyImmersiveMode();
     }
 
     @Override
     protected void onResume() {
         super.onResume();
         if (webView != null) webView.onResume();
-        applyFullscreen();
+        applyImmersiveMode();
     }
 
     @Override
@@ -296,7 +323,9 @@ public class MainActivity extends Activity {
 
     @Override
     public void onBackPressed() {
-        if (webView != null && webView.canGoBack()) {
+        if (fullscreenCustomView != null) {
+            hideCustomView();
+        } else if (webView != null && webView.canGoBack()) {
             webView.goBack();
         } else {
             super.onBackPressed();
