@@ -54,3 +54,12 @@ app/build/outputs/apk/debug/app-debug.apk
 - Alterações feitas no site publicado aparecem no aplicativo sem precisar recompilar o APK.
 - O workflow gera um APK **Debug assinado com a chave de depuração automática do Android Gradle Plugin**, adequado para instalar e testar. Para publicação na Play Store, será necessário configurar uma chave de assinatura Release própria.
 - O ZIP contém o projeto-fonte e o workflow; o APK é gerado pelo GitHub Actions após o envio do projeto.
+
+
+## Versão 1.0.2
+
+- Inicialização da tela de abertura antes da configuração do modo imersivo.
+- WebView criado somente com o contexto da Activity.
+- Tratamento de falhas na inicialização com mensagem visível na tela.
+- Modo de tela cheia simplificado para maior compatibilidade entre versões do Android.
+- Target SDK ajustado para 34.
